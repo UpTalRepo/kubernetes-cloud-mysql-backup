@@ -25,12 +25,26 @@ if [ ! -z "$GCP_GCLOUD_AUTH" ]; then
 
 fi
 
+# Configure Azure CLI authentication if Azure credentials are set
+if [ ! -z "$AZURE_STORAGE_ACCOUNT_NAME" ] && [ ! -z "$AZURE_STORAGE_ACCESS_KEY" ]; then
+    export AZURE_STORAGE_ACCOUNT="$AZURE_STORAGE_ACCOUNT_NAME"
+    export AZURE_STORAGE_KEY="$AZURE_STORAGE_ACCESS_KEY"
+fi
+
 # Set the BACKUP_CREATE_DATABASE_STATEMENT variable
 if [ "$BACKUP_CREATE_DATABASE_STATEMENT" = "true" ]; then
     BACKUP_CREATE_DATABASE_STATEMENT="--databases"
 else
     BACKUP_CREATE_DATABASE_STATEMENT=""
 fi
+
+# Set default authentication plugin if not specified
+if [ -z "$MYSQL_AUTH_PLUGIN" ]; then
+    MYSQL_AUTH_PLUGIN="caching_sha2_password"
+fi
+
+# Build MySQL connection options with authentication plugin
+MYSQL_AUTH_OPTS="--default-auth=$MYSQL_AUTH_PLUGIN"
 
 if [ "$TARGET_ALL_DATABASES" = "true" ]; then
     # Ignore any databases specified by TARGET_DATABASE_NAMES
@@ -42,7 +56,7 @@ if [ "$TARGET_ALL_DATABASES" = "true" ]; then
     # Build Database List
     ALL_DATABASES_EXCLUSION_LIST="'mysql','sys','tmp','information_schema','performance_schema'"
     ALL_DATABASES_SQLSTMT="SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN (${ALL_DATABASES_EXCLUSION_LIST})"
-    if ! ALL_DATABASES_DATABASE_LIST=`mysql -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT -ANe"${ALL_DATABASES_SQLSTMT}"`
+    if ! ALL_DATABASES_DATABASE_LIST=`mysql $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT -ANe"${ALL_DATABASES_SQLSTMT}"`
     then
         echo -e "Building list of all databases failed at $(date +'%d-%m-%Y %H:%M:%S')." | tee -a /tmp/kubernetes-cloud-mysql-backup.log
         has_failed=true
@@ -64,7 +78,7 @@ if [ "$has_failed" = false ]; then
 
         DUMP=$BASE_DUMP_PATH$CURRENT_DATABASE$(date +$BACKUP_TIMESTAMP).sql
         # Perform the database backup. Put the output to a variable. If successful upload the backup to S3, if unsuccessful print an entry to the console and the log, and set has_failed to true.
-        if sqloutput=$(mysqldump -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT $CURRENT_DATABASE 2>&1 >$DUMP); then
+        if sqloutput=$(mysqldump $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT $CURRENT_DATABASE 2>&1 >$DUMP); then
 
             echo -e "Database backup successfully completed for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
         else
@@ -79,10 +93,10 @@ if [ "$has_failed" = false ]; then
 
     # Convert BACKUP_COMPRESS to lowercase before executing if statement
     BACKUP_COMPRESS=$(echo "$BACKUP_COMPRESS" | awk '{print tolower($0)}')
-    
-    # tar folder 
+
+    # tar folder - using -C to change directory so files are at root of archive
     DUMP=$(date +$BACKUP_TIMESTAMP)
-    tar -zcvf /tmp/"$DUMP".tar.gz $BASE_DUMP_PATH
+    tar -zcvf /tmp/"$DUMP".tar.gz -C $BASE_DUMP_PATH .
     rm -rf $BASE_DUMP_PATH
     DUMP="$DUMP".tar.gz
 
@@ -137,6 +151,27 @@ if [ "$has_failed" = false ]; then
         fi
         rm /tmp/"$DUMP"
     fi
+
+    # If the Backup Provider is Azure, then upload to Azure Blob Storage
+    if [ "$BACKUP_PROVIDER" = "azure" ]; then
+
+        # Construct the blob path (remove leading slash if present)
+        AZURE_BLOB_PATH="${AZURE_BACKUP_PATH#/}"
+        if [ ! -z "$AZURE_BLOB_PATH" ]; then
+            AZURE_BLOB_PATH="${AZURE_BLOB_PATH}/${DUMP}"
+        else
+            AZURE_BLOB_PATH="${DUMP}"
+        fi
+
+        # Perform the upload to Azure Blob Storage. Put the output to a variable. If successful, print an entry to the console and the log. If unsuccessful, set has_failed to true and print an entry to the console and the log
+        if azureoutput=$(az storage blob upload --container-name "$AZURE_CONTAINER_NAME" --file /tmp/$DUMP --name "$AZURE_BLOB_PATH" --overwrite 2>&1); then
+            echo -e "Database backup successfully uploaded for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
+        else
+            echo -e "Database backup failed to upload for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). Error: $azureoutput" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
+            has_failed=true
+        fi
+        rm /tmp/"$DUMP"
+    fi
 fi
 
 # Check if any of the backups have failed. If so, exit with a status of 1. Otherwise exit cleanly with a status of 0.
@@ -186,6 +221,25 @@ else
                 oldest_file=$(gsutil ls -l gs://$GCP_BUCKET_NAME$GCP_BUCKET_BACKUP_PATH/ | sort -k2,1 | head -n 2 | tail -n 1 | awk '{print $NF}')
                 oldest_file=$(basename $oldest_file)
                 gsutil rm gs://$GCP_BUCKET_NAME$GCP_BUCKET_BACKUP_PATH/$oldest_file
+                num_files=$(($num_files - 1))
+                deleted_files=$(($deleted_files + 1))
+            done
+        fi
+
+        if [ "$BACKUP_PROVIDER" = "azure" ]; then
+            # Construct the blob prefix path (remove leading slash if present)
+            AZURE_BLOB_PREFIX="${AZURE_BACKUP_PATH#/}"
+            if [ ! -z "$AZURE_BLOB_PREFIX" ]; then
+                AZURE_BLOB_PREFIX="${AZURE_BLOB_PREFIX}/"
+            fi
+
+            # Get list of blobs sorted by creation time
+            num_files=$(az storage blob list --container-name "$AZURE_CONTAINER_NAME" --prefix "$AZURE_BLOB_PREFIX" --query "length([])" --output tsv)
+            while [ $num_files -gt $MAX_FILES_TO_KEEP ]
+            do
+                # Get oldest blob by creation time
+                oldest_blob=$(az storage blob list --container-name "$AZURE_CONTAINER_NAME" --prefix "$AZURE_BLOB_PREFIX" --query "sort_by([], &properties.creationTime)[0].name" --output tsv)
+                az storage blob delete --container-name "$AZURE_CONTAINER_NAME" --name "$oldest_blob"
                 num_files=$(($num_files - 1))
                 deleted_files=$(($deleted_files + 1))
             done

@@ -19,7 +19,7 @@ RUN apk -v --update add \
     tar \
     go \
     git && \
-    pip3 install --upgrade awscli s3cmd python-magic && \
+    pip3 install --upgrade awscli s3cmd python-magic azure-cli && \
     rm /var/cache/apk/*
 
 # Set Default Environment Variables
@@ -32,6 +32,7 @@ ENV CLOUD_SDK_VERSION=367.0.0
 ENV AGE_VERSION=552aa0a07de0b42c16126d3107bd8895184a69e7
 ENV BACKUP_PROVIDER=aws
 ENV MAX_FILES_TO_KEEP=0
+ENV MYSQL_AUTH_PLUGIN=caching_sha2_password
 
 # Install FiloSottile/age (https://github.com/FiloSottile/age)
 RUN git clone https://filippo.io/age && \
