@@ -26,4 +26,4 @@ RUN chmod +x /stream-to-azure.py
 
 COPY resources/perform-backup.sh /
 RUN chmod +x /perform-backup.sh
-CMD ["sh", "/perform-backup.sh"]
+CMD ["bash", "/perform-backup.sh"]
