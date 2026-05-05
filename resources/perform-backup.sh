@@ -115,7 +115,7 @@ if [ "$has_failed" = false ]; then
                     $CURRENT_DATABASE 2>/tmp/mysqldump_stderr_${CURRENT_DATABASE}.log; \
                     echo $? > "$PIPE_STATUS_FILE") | \
                     gzip -${BACKUP_COMPRESS_LEVEL} | \
-                    python3 /stream-to-azure.py "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PATH" \
+                    python3 /stream-to-azure.py stream "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PATH" \
                         2>/tmp/az_stderr_${CURRENT_DATABASE}.log
 
                 AZ_EXIT=$?
@@ -129,7 +129,7 @@ if [ "$has_failed" = false ]; then
                     $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT \
                     $CURRENT_DATABASE 2>/tmp/mysqldump_stderr_${CURRENT_DATABASE}.log; \
                     echo $? > "$PIPE_STATUS_FILE") | \
-                    python3 /stream-to-azure.py "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PATH" \
+                    python3 /stream-to-azure.py stream "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PATH" \
                         2>/tmp/az_stderr_${CURRENT_DATABASE}.log
 
                 AZ_EXIT=$?
@@ -143,7 +143,7 @@ if [ "$has_failed" = false ]; then
                 echo -e "Database backup FAILED for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). mysqldump error: $MYSQLDUMP_ERR" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
                 has_failed=true
                 # Delete the partial/corrupt blob if it was uploaded
-                az storage blob delete --container-name "$AZURE_CONTAINER_NAME" --name "$AZURE_BLOB_PATH" 2>/dev/null || true
+                python3 /stream-to-azure.py delete "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PATH" 2>/dev/null || true
                 continue
             fi
 
@@ -338,12 +338,11 @@ else
             fi
 
             # Get list of blobs sorted by creation time
-            num_files=$(az storage blob list --container-name "$AZURE_CONTAINER_NAME" --prefix "$AZURE_BLOB_PREFIX" --query "length([])" --output tsv)
+            num_files=$(python3 /stream-to-azure.py count "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PREFIX")
             while [ $num_files -gt $MAX_FILES_TO_KEEP ]
             do
-                # Get oldest blob by creation time
-                oldest_blob=$(az storage blob list --container-name "$AZURE_CONTAINER_NAME" --prefix "$AZURE_BLOB_PREFIX" --query "sort_by([], &properties.creationTime)[0].name" --output tsv)
-                az storage blob delete --container-name "$AZURE_CONTAINER_NAME" --name "$oldest_blob"
+                oldest_blob=$(python3 /stream-to-azure.py oldest "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PREFIX")
+                python3 /stream-to-azure.py delete "$AZURE_CONTAINER_NAME" "$oldest_blob"
                 num_files=$(($num_files - 1))
                 deleted_files=$(($deleted_files + 1))
             done

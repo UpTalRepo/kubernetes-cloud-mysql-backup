@@ -8,7 +8,7 @@ RUN apk -v --update add \
     bash \
     coreutils \
     gzip && \
-    pip3 install --upgrade azure-cli && \
+    pip3 install azure-storage-blob && \
     rm /var/cache/apk/*
 
 ENV BACKUP_CREATE_DATABASE_STATEMENT=false
