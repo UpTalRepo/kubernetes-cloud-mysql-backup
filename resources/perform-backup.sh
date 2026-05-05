@@ -2,13 +2,12 @@
 
 # Set the has_failed variable to false. This will change if any of the subsequent database backups/uploads fail.
 has_failed=false
-BASE_DUMP_PATH=/tmp/full_database_backups/
 
-# Create Document Root if it doesn't exist
-if [ ! -d "$BASE_DUMP_PATH" ]; then
-    mkdir -p "$BASE_DUMP_PATH"
-fi
+# Streaming mode: pipe mysqldump | gzip directly to cloud storage without writing to local disk.
+# This prevents ephemeral disk exhaustion on single-node clusters with large databases.
+# Each database is uploaded as a separate compressed blob.
 
+BACKUP_TIMESTAMP_VALUE=$(date +${BACKUP_TIMESTAMP})
 
 # Create the GCloud Authentication file if set
 if [ ! -z "$GCP_GCLOUD_AUTH" ]; then
@@ -72,106 +71,211 @@ if [ "$TARGET_ALL_DATABASES" = "true" ]; then
     fi
 fi
 
-# Loop through all the defined databases, seperating by a ,
+# Convert BACKUP_PROVIDER to lowercase
+BACKUP_PROVIDER=$(echo "$BACKUP_PROVIDER" | awk '{print tolower($0)}')
+
+# Convert BACKUP_COMPRESS to lowercase
+BACKUP_COMPRESS=$(echo "$BACKUP_COMPRESS" | awk '{print tolower($0)}')
+
+# Set compression level
+if [ -z "$BACKUP_COMPRESS_LEVEL" ]; then
+    BACKUP_COMPRESS_LEVEL="9"
+fi
+
+# Loop through all the defined databases, separating by a ,
 if [ "$has_failed" = false ]; then
     for CURRENT_DATABASE in ${TARGET_DATABASE_NAMES//,/ }; do
 
-        DUMP=$BASE_DUMP_PATH$CURRENT_DATABASE$(date +$BACKUP_TIMESTAMP).sql
-        # Perform the database backup. Put the output to a variable. If successful upload the backup to S3, if unsuccessful print an entry to the console and the log, and set has_failed to true.
-        if sqloutput=$(mysqldump $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT $CURRENT_DATABASE 2>&1 >$DUMP); then
+        # Build the blob/object name for this database
+        DUMP_NAME="${CURRENT_DATABASE}${BACKUP_TIMESTAMP_VALUE}.sql"
+        if [ "$BACKUP_COMPRESS" = "true" ]; then
+            DUMP_NAME="${DUMP_NAME}.gz"
+        fi
 
-            echo -e "Database backup successfully completed for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
+        echo -e "Starting streaming backup for database: $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')..."
+
+        # ---- AZURE: Stream mysqldump | gzip | python3 stream-to-azure.py ----
+        if [ "$BACKUP_PROVIDER" = "azure" ]; then
+
+            # Construct the blob path
+            AZURE_BLOB_PATH="${AZURE_BACKUP_PATH#/}"
+            if [ ! -z "$AZURE_BLOB_PATH" ]; then
+                AZURE_BLOB_PATH="${AZURE_BLOB_PATH}/${DUMP_NAME}"
+            else
+                AZURE_BLOB_PATH="${DUMP_NAME}"
+            fi
+
+            if [ "$BACKUP_COMPRESS" = "true" ]; then
+                # Stream: mysqldump | gzip | python upload via block blob API (stdin, no disk)
+                # Use pipefail-safe approach: write mysqldump exit code to a temp file
+                PIPE_STATUS_FILE=$(mktemp)
+                (mysqldump $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST \
+                    -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT \
+                    $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT \
+                    $CURRENT_DATABASE 2>/tmp/mysqldump_stderr_${CURRENT_DATABASE}.log; \
+                    echo $? > "$PIPE_STATUS_FILE") | \
+                    gzip -${BACKUP_COMPRESS_LEVEL} | \
+                    python3 /stream-to-azure.py "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PATH" \
+                        2>/tmp/az_stderr_${CURRENT_DATABASE}.log
+
+                AZ_EXIT=$?
+                MYSQLDUMP_EXIT=$(cat "$PIPE_STATUS_FILE" 2>/dev/null || echo "1")
+                rm -f "$PIPE_STATUS_FILE"
+            else
+                # Stream without compression: mysqldump | python upload via block blob API (stdin, no disk)
+                PIPE_STATUS_FILE=$(mktemp)
+                (mysqldump $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST \
+                    -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT \
+                    $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT \
+                    $CURRENT_DATABASE 2>/tmp/mysqldump_stderr_${CURRENT_DATABASE}.log; \
+                    echo $? > "$PIPE_STATUS_FILE") | \
+                    python3 /stream-to-azure.py "$AZURE_CONTAINER_NAME" "$AZURE_BLOB_PATH" \
+                        2>/tmp/az_stderr_${CURRENT_DATABASE}.log
+
+                AZ_EXIT=$?
+                MYSQLDUMP_EXIT=$(cat "$PIPE_STATUS_FILE" 2>/dev/null || echo "1")
+                rm -f "$PIPE_STATUS_FILE"
+            fi
+
+            # Check mysqldump exit code
+            if [ "$MYSQLDUMP_EXIT" != "0" ]; then
+                MYSQLDUMP_ERR=$(cat /tmp/mysqldump_stderr_${CURRENT_DATABASE}.log 2>/dev/null)
+                echo -e "Database backup FAILED for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). mysqldump error: $MYSQLDUMP_ERR" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
+                has_failed=true
+                # Delete the partial/corrupt blob if it was uploaded
+                az storage blob delete --container-name "$AZURE_CONTAINER_NAME" --name "$AZURE_BLOB_PATH" 2>/dev/null || true
+                continue
+            fi
+
+            # Check upload exit code
+            if [ "$AZ_EXIT" != "0" ]; then
+                AZ_ERR=$(cat /tmp/az_stderr_${CURRENT_DATABASE}.log 2>/dev/null)
+                echo -e "Database backup upload FAILED for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). Azure error: $AZ_ERR" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
+                has_failed=true
+                continue
+            fi
+
+            echo -e "Database backup successfully streamed and uploaded for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
+
+        # ---- AWS: Stream mysqldump | gzip | aws s3 cp ----
+        elif [ "$BACKUP_PROVIDER" = "aws" ]; then
+
+            # If the AWS_S3_ENDPOINT variable isn't empty, then populate the --endpoint-url parameter
+            if [ ! -z "$AWS_S3_ENDPOINT" ]; then
+                ENDPOINT="--endpoint-url=$AWS_S3_ENDPOINT"
+            fi
+
+            S3_PATH="s3://$AWS_BUCKET_NAME$AWS_BUCKET_BACKUP_PATH/$DUMP_NAME"
+
+            if [ "$BACKUP_COMPRESS" = "true" ]; then
+                PIPE_STATUS_FILE=$(mktemp)
+                (mysqldump $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST \
+                    -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT \
+                    $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT \
+                    $CURRENT_DATABASE 2>/tmp/mysqldump_stderr_${CURRENT_DATABASE}.log; \
+                    echo $? > "$PIPE_STATUS_FILE") | \
+                    gzip -${BACKUP_COMPRESS_LEVEL} | \
+                    aws $ENDPOINT s3 cp - "$S3_PATH" \
+                        2>/tmp/aws_stderr_${CURRENT_DATABASE}.log
+
+                AWS_EXIT=$?
+                MYSQLDUMP_EXIT=$(cat "$PIPE_STATUS_FILE" 2>/dev/null || echo "1")
+                rm -f "$PIPE_STATUS_FILE"
+            else
+                PIPE_STATUS_FILE=$(mktemp)
+                (mysqldump $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST \
+                    -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT \
+                    $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT \
+                    $CURRENT_DATABASE 2>/tmp/mysqldump_stderr_${CURRENT_DATABASE}.log; \
+                    echo $? > "$PIPE_STATUS_FILE") | \
+                    aws $ENDPOINT s3 cp - "$S3_PATH" \
+                        2>/tmp/aws_stderr_${CURRENT_DATABASE}.log
+
+                AWS_EXIT=$?
+                MYSQLDUMP_EXIT=$(cat "$PIPE_STATUS_FILE" 2>/dev/null || echo "1")
+                rm -f "$PIPE_STATUS_FILE"
+            fi
+
+            if [ "$MYSQLDUMP_EXIT" != "0" ]; then
+                MYSQLDUMP_ERR=$(cat /tmp/mysqldump_stderr_${CURRENT_DATABASE}.log 2>/dev/null)
+                echo -e "Database backup FAILED for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). mysqldump error: $MYSQLDUMP_ERR" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
+                has_failed=true
+                aws $ENDPOINT s3 rm "$S3_PATH" 2>/dev/null || true
+                continue
+            fi
+
+            if [ "$AWS_EXIT" != "0" ]; then
+                AWS_ERR=$(cat /tmp/aws_stderr_${CURRENT_DATABASE}.log 2>/dev/null)
+                echo -e "Database backup upload FAILED for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). AWS error: $AWS_ERR" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
+                has_failed=true
+                continue
+            fi
+
+            echo -e "Database backup successfully streamed and uploaded for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
+
+        # ---- GCP: Stream mysqldump | gzip | gsutil cp ----
+        elif [ "$BACKUP_PROVIDER" = "gcp" ]; then
+
+            GCS_PATH="gs://$GCP_BUCKET_NAME$GCP_BUCKET_BACKUP_PATH/$DUMP_NAME"
+
+            if [ "$BACKUP_COMPRESS" = "true" ]; then
+                PIPE_STATUS_FILE=$(mktemp)
+                (mysqldump $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST \
+                    -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT \
+                    $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT \
+                    $CURRENT_DATABASE 2>/tmp/mysqldump_stderr_${CURRENT_DATABASE}.log; \
+                    echo $? > "$PIPE_STATUS_FILE") | \
+                    gzip -${BACKUP_COMPRESS_LEVEL} | \
+                    gsutil cp - "$GCS_PATH" \
+                        2>/tmp/gcs_stderr_${CURRENT_DATABASE}.log
+
+                GCS_EXIT=$?
+                MYSQLDUMP_EXIT=$(cat "$PIPE_STATUS_FILE" 2>/dev/null || echo "1")
+                rm -f "$PIPE_STATUS_FILE"
+            else
+                PIPE_STATUS_FILE=$(mktemp)
+                (mysqldump $MYSQL_AUTH_OPTS -u $TARGET_DATABASE_USER -h $TARGET_DATABASE_HOST \
+                    -p$TARGET_DATABASE_PASSWORD -P $TARGET_DATABASE_PORT \
+                    $BACKUP_ADDITIONAL_PARAMS $BACKUP_CREATE_DATABASE_STATEMENT \
+                    $CURRENT_DATABASE 2>/tmp/mysqldump_stderr_${CURRENT_DATABASE}.log; \
+                    echo $? > "$PIPE_STATUS_FILE") | \
+                    gsutil cp - "$GCS_PATH" \
+                        2>/tmp/gcs_stderr_${CURRENT_DATABASE}.log
+
+                GCS_EXIT=$?
+                MYSQLDUMP_EXIT=$(cat "$PIPE_STATUS_FILE" 2>/dev/null || echo "1")
+                rm -f "$PIPE_STATUS_FILE"
+            fi
+
+            if [ "$MYSQLDUMP_EXIT" != "0" ]; then
+                MYSQLDUMP_ERR=$(cat /tmp/mysqldump_stderr_${CURRENT_DATABASE}.log 2>/dev/null)
+                echo -e "Database backup FAILED for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). mysqldump error: $MYSQLDUMP_ERR" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
+                has_failed=true
+                gsutil rm "$GCS_PATH" 2>/dev/null || true
+                continue
+            fi
+
+            if [ "$GCS_EXIT" != "0" ]; then
+                GCS_ERR=$(cat /tmp/gcs_stderr_${CURRENT_DATABASE}.log 2>/dev/null)
+                echo -e "Database backup upload FAILED for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). GCP error: $GCS_ERR" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
+                has_failed=true
+                continue
+            fi
+
+            echo -e "Database backup successfully streamed and uploaded for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
+
         else
-            echo -e "Database backup FAILED for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). Error: $sqloutput" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
+            echo -e "Unknown BACKUP_PROVIDER: $BACKUP_PROVIDER. Skipping $CURRENT_DATABASE." | tee -a /tmp/kubernetes-cloud-mysql-backup.log
             has_failed=true
         fi
+
+        # Clean up stderr files for this database
+        rm -f /tmp/mysqldump_stderr_${CURRENT_DATABASE}.log
+        rm -f /tmp/az_stderr_${CURRENT_DATABASE}.log
+        rm -f /tmp/aws_stderr_${CURRENT_DATABASE}.log
+        rm -f /tmp/gcs_stderr_${CURRENT_DATABASE}.log
 
     done
-fi
-
-if [ "$has_failed" = false ]; then
-
-    # Convert BACKUP_COMPRESS to lowercase before executing if statement
-    BACKUP_COMPRESS=$(echo "$BACKUP_COMPRESS" | awk '{print tolower($0)}')
-
-    # tar folder - using -C to change directory so files are at root of archive
-    DUMP=$(date +$BACKUP_TIMESTAMP)
-    tar -zcvf /tmp/"$DUMP".tar.gz -C $BASE_DUMP_PATH .
-    rm -rf $BASE_DUMP_PATH
-    DUMP="$DUMP".tar.gz
-
-    # If the Backup Compress is true, then compress the file for .gz format
-    if [ "$BACKUP_COMPRESS" = "true" ]; then
-        if [ -z "$BACKUP_COMPRESS_LEVEL" ]; then
-            BACKUP_COMPRESS_LEVEL="9"
-        fi
-        gzip -${BACKUP_COMPRESS_LEVEL} -c /tmp/"$DUMP" >/tmp/"$DUMP".gz
-        rm /tmp/"$DUMP"
-        DUMP="$DUMP".gz
-    fi
-
-    # Optionally encrypt the backup
-    if [ -n "$AGE_PUBLIC_KEY" ]; then
-        cat /tmp/"$DUMP" | age -a -r "$AGE_PUBLIC_KEY" >/tmp/"$DUMP".age
-        echo -e "Encrypted backup with age"
-        rm /tmp/"$DUMP"
-        DUMP="$DUMP".age
-    fi
-
-    # Convert BACKUP_PROVIDER to lowercase before executing if statement
-    BACKUP_PROVIDER=$(echo "$BACKUP_PROVIDER" | awk '{print tolower($0)}')
-
-    # If the Backup Provider is AWS, then upload to S3
-    if [ "$BACKUP_PROVIDER" = "aws" ]; then
-
-        # If the AWS_S3_ENDPOINT variable isn't empty, then populate the --endpoint-url parameter to use a custom S3 compatable endpoint
-        if [ ! -z "$AWS_S3_ENDPOINT" ]; then
-            ENDPOINT="--endpoint-url=$AWS_S3_ENDPOINT"
-        fi
-
-        # Perform the upload to S3. Put the output to a variable. If successful, print an entry to the console and the log. If unsuccessful, set has_failed to true and print an entry to the console and the log
-        if awsoutput=$(aws $ENDPOINT s3 cp /tmp/$DUMP s3://$AWS_BUCKET_NAME$AWS_BUCKET_BACKUP_PATH/$DUMP 2>&1); then
-            echo -e "Database backup successfully uploaded for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
-        else
-            echo -e "Database backup failed to upload for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). Error: $awsoutput" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
-            has_failed=true
-        fi
-        rm /tmp/"$DUMP"
-    fi
-
-    # If the Backup Provider is GCP, then upload to GCS
-    if [ "$BACKUP_PROVIDER" = "gcp" ]; then
-
-        # Perform the upload to S3. Put the output to a variable. If successful, print an entry to the console and the log. If unsuccessful, set has_failed to true and print an entry to the console and the log
-        if gcpoutput=$(gsutil cp /tmp/$DUMP gs://$GCP_BUCKET_NAME$GCP_BUCKET_BACKUP_PATH/$DUMP 2>&1); then
-            echo -e "Database backup successfully uploaded for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
-        else
-            echo -e "Database backup failed to upload for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). Error: $gcpoutput" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
-            has_failed=true
-        fi
-        rm /tmp/"$DUMP"
-    fi
-
-    # If the Backup Provider is Azure, then upload to Azure Blob Storage
-    if [ "$BACKUP_PROVIDER" = "azure" ]; then
-
-        # Construct the blob path (remove leading slash if present)
-        AZURE_BLOB_PATH="${AZURE_BACKUP_PATH#/}"
-        if [ ! -z "$AZURE_BLOB_PATH" ]; then
-            AZURE_BLOB_PATH="${AZURE_BLOB_PATH}/${DUMP}"
-        else
-            AZURE_BLOB_PATH="${DUMP}"
-        fi
-
-        # Perform the upload to Azure Blob Storage. Put the output to a variable. If successful, print an entry to the console and the log. If unsuccessful, set has_failed to true and print an entry to the console and the log
-        if azureoutput=$(az storage blob upload --container-name "$AZURE_CONTAINER_NAME" --file /tmp/$DUMP --name "$AZURE_BLOB_PATH" --overwrite 2>&1); then
-            echo -e "Database backup successfully uploaded for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S')."
-        else
-            echo -e "Database backup failed to upload for $CURRENT_DATABASE at $(date +'%d-%m-%Y %H:%M:%S'). Error: $azureoutput" | tee -a /tmp/kubernetes-cloud-mysql-backup.log
-            has_failed=true
-        fi
-        rm /tmp/"$DUMP"
-    fi
 fi
 
 # Check if any of the backups have failed. If so, exit with a status of 1. Otherwise exit cleanly with a status of 0.
@@ -193,7 +297,7 @@ if [ "$has_failed" = true ]; then
     exit 1
 
 else
-    
+
     # If Slack alerts are enabled, send a notification that all database backups were successful
     if [ "$SLACK_ENABLED" = "true" ]; then
         /slack-alert.sh "All database backups successfully completed on database host $TARGET_DATABASE_HOST."

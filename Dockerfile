@@ -56,6 +56,10 @@ RUN curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cl
 COPY resources/slack-alert.sh /
 RUN chmod +x /slack-alert.sh
 
+# Copy Azure streaming upload helper
+COPY resources/stream-to-azure.py /
+RUN chmod +x /stream-to-azure.py
+
 # Copy backup script and execute
 COPY resources/perform-backup.sh /
 RUN chmod +x /perform-backup.sh
