@@ -1,16 +1,14 @@
-FROM alpine:3.15.0
+FROM debian:bookworm-slim
 
-RUN apk -v --update add \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
-    py-pip \
-    mysql-client \
+    python3-pip \
+    default-mysql-client \
     curl \
     bash \
-    coreutils \
     gzip && \
-    pip3 install --upgrade pip && \
-    pip3 install azure-storage-blob && \
-    rm /var/cache/apk/*
+    pip3 install --break-system-packages azure-storage-blob && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENV BACKUP_CREATE_DATABASE_STATEMENT=false
 ENV TARGET_DATABASE_PORT=3306
