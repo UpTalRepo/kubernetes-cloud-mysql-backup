@@ -8,6 +8,7 @@ RUN apk -v --update add \
     bash \
     coreutils \
     gzip && \
+    pip3 install --upgrade pip && \
     pip3 install azure-storage-blob && \
     rm /var/cache/apk/*
 
