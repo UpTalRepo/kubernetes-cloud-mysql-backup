@@ -3,9 +3,6 @@ on:
   push:
     branches:
       - master
-    paths-ignore:
-      - '**.md'
-      - '.github/**'
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
